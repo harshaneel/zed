@@ -1,4 +1,10 @@
 [
+  {
+    "context": "PdfViewer",
+    "bindings": {
+      "cmd-c": "pdf_viewer::CopySelection"
+    }
+  },
   // Standard macOS bindings
   {
     "use_key_equivalents": true,
