@@ -1,3 +1,45 @@
+# Zed + Native PDF Viewer (unofficial fork)
+
+> **This is an unofficial fork of [zed-industries/zed](https://github.com/zed-industries/zed).**
+> It is **not affiliated with, sponsored by, or endorsed by Zed Industries.**
+>
+> All credit for Zed itself belongs to **Zed Industries, Inc.** and the
+> [Zed contributors](https://github.com/zed-industries/zed/graphs/contributors).
+> "Zed" and the Zed logo are trademarks of Zed Industries, Inc.; this fork is
+> distributed as **source only** (no branded binaries), and the upstream license
+> is unchanged (see [Licensing](#licensing)).
+
+## What this fork adds
+
+A native, **pure-Rust PDF viewer** (`crates/pdf_viewer`) — `.pdf` files open in a
+scrollable rendered pane instead of as a binary blob:
+
+- **Rendering** via the pure-Rust [hayro](https://crates.io/crates/hayro) PDF engine — no Chromium, no native libraries, no bundled dylib.
+- **Text selection** — click-drag with auto-scroll at the viewport edges, spanning pages.
+- **Copy** — `Cmd+C` or right-click → Copy.
+- **Hyperlinks** — click a link to open it; pointer cursor on hover.
+
+Attribution for the added feature: PDF rendering and text extraction are powered
+by [**hayro**](https://crates.io/crates/hayro) (and the vello / kurbo crates it
+builds on); the viewer is drawn with Zed's own GPUI. Design notes and known
+limitations are in [`crates/pdf_viewer/README.md`](./crates/pdf_viewer/README.md).
+
+### Build & run this fork (macOS)
+
+```bash
+git clone -b pdf-viewer https://github.com/harshaneel/zed.git
+cd zed
+# Prereqs in BUILD.md: Rust, `brew install cmake`, Xcode + Metal Toolchain
+export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+cargo run -p zed   # then open any .pdf
+```
+
+Full, sudo-free instructions: [**BUILD.md**](./BUILD.md).
+
+---
+
+The remainder of this README is from upstream Zed, unchanged.
+
 # Zed
 
 [![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
