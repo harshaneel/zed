@@ -728,9 +728,15 @@ impl PdfView {
             return false; // not at an edge; pause until the cursor returns
         };
 
-        let mut offset = self.scroll_handle.offset();
+        let before = self.scroll_handle.offset();
+        let mut offset = before;
         offset.y -= px(delta); // scrolling down (delta > 0) moves content up
         self.scroll_handle.set_offset(offset);
+        // set_offset clamps; if we're already at the top/bottom there's no
+        // progress, so stop the loop instead of spinning at 60fps.
+        if (f32::from(self.scroll_handle.offset().y) - f32::from(before.y)).abs() < 0.5 {
+            return false;
+        }
 
         if let Some(g) = self.glyph_at(mouse, cx)
             && let Some(selection) = self.selection
@@ -744,20 +750,42 @@ impl PdfView {
     fn selected_text(&self, cx: &App) -> Option<String> {
         let (lo, hi) = self.selection?.bounds();
         let pages = &self.pdf_item.read(cx).pages;
+
+        // Gather the selected glyphs in reading order across pages.
+        let mut selected: Vec<&TextGlyph> = Vec::new();
         let mut offset = 0;
-        let mut text = String::new();
         for page in pages {
             let (start, end) = (offset, offset + page.glyphs.len());
             let a = lo.max(start);
             let b = (hi + 1).min(end);
             if a < b {
-                for g in &page.glyphs[a - start..b - start] {
-                    text.push_str(&g.text);
-                }
+                selected.extend(page.glyphs[a - start..b - start].iter());
             }
             offset = end;
         }
-        (!text.is_empty()).then_some(text)
+        if selected.is_empty() {
+            return None;
+        }
+
+        // Insert newlines at line/column/page breaks (same heuristic as the
+        // highlight bars) so copied text isn't run together at line ends.
+        let cmp = |a: f32, b: f32| a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal);
+        let mut heights: Vec<f32> = selected.iter().map(|g| g.h).filter(|h| *h > 0.0).collect();
+        heights.sort_by(|a, b| cmp(*a, *b));
+        let tol = heights.get(heights.len() / 2).copied().unwrap_or(10.0) * 0.6;
+
+        let mut text = String::new();
+        let mut prev_x = f32::MIN;
+        let mut line_y = selected[0].y;
+        for (i, g) in selected.iter().enumerate() {
+            if i > 0 && (g.x < prev_x - 0.5 || (g.h > 0.0 && (g.y - line_y).abs() > tol)) {
+                text.push('\n');
+                line_y = g.y;
+            }
+            text.push_str(&g.text);
+            prev_x = g.x;
+        }
+        (!text.trim().is_empty()).then_some(text)
     }
 
     fn copy(&mut self, _: &CopySelection, _: &mut Window, cx: &mut Context<Self>) {
