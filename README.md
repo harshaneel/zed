@@ -36,6 +36,23 @@ cargo run -p zed   # then open any .pdf
 
 Full, sudo-free instructions: [**BUILD.md**](./BUILD.md).
 
+### Footprint
+
+Rendering PDFs with pure-Rust hayro (instead of embedding Chromium/`pdfium`) keeps
+the editor native. With a large production Rails 8 / Ruby monorepo open in both — a
+workload that spins up Ruby LSP, Sorbet, RuboCop, a Node LSP, and file watchers — and
+measured idle after indexing settled, with each editor credited its **entire process
+tree** (editor + every spawned language server):
+
+| Metric        | This fork (+ all LSPs) | Electron editor (all procs) | Result             |
+| ------------- | ---------------------- | --------------------------- | ------------------ |
+| **RAM (RSS)** | **249 MB**             | 4,439 MB                    | **~17.8× lighter** |
+| Processes     | 10                     | 137                         | ~13.7× fewer       |
+| Idle CPU      | ~0%                    | ~12%                        | idle vs not idle   |
+
+No bundled browser engine, and the PDF viewer adds no native runtime or extra process.
+Full methodology and per-process breakdown: [**BENCHMARKS.md**](./BENCHMARKS.md).
+
 ---
 
 The remainder of this README is from upstream Zed, unchanged.
