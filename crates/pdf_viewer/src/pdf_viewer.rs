@@ -12,10 +12,10 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow};
 use gpui::{
-    App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
-    Point, Render, RenderImage, ScrollHandle, SharedString, Styled, Task, Window, actions, div, img,
-    px, rgba,
+    App, ClipboardItem, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
+    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
+    Point, Render, RenderImage, ScrollHandle, SharedString, Styled, Subscription, Task, Window,
+    actions, anchored, deferred, div, img, px, rgba,
 };
 use hayro::hayro_interpret::font::Glyph;
 use hayro::hayro_interpret::hayro_cmap::BfString;
@@ -32,8 +32,8 @@ use hayro::{RenderCache, RenderSettings, render};
 use image::{Frame, RgbaImage};
 use project::{Project, ProjectEntryId, ProjectPath};
 use smallvec::smallvec;
+use ui::ContextMenu;
 use ui::prelude::*;
-use ui::{ContextMenu, right_click_menu};
 use workspace::{
     Pane,
     item::{Item, ProjectItem},
@@ -41,8 +41,13 @@ use workspace::{
 
 /// Width each page is rasterized to, in pixels. Higher = sharper but heavier.
 const RASTER_WIDTH: f32 = 1600.0;
-/// On-screen page width (the rendered bitmap is scaled to this).
-const DISPLAY_WIDTH: f32 = 900.0;
+/// Default on-screen page width before any zoom (bitmap is scaled to this).
+const DEFAULT_DISPLAY_WIDTH: f32 = 900.0;
+/// Clamp range for the zoomable on-screen page width.
+const MIN_DISPLAY_WIDTH: f32 = 200.0;
+const MAX_DISPLAY_WIDTH: f32 = 4000.0;
+/// Multiplicative zoom step.
+const ZOOM_STEP: f32 = 1.2;
 /// Vertical gap above the first page and between pages (matches the render's
 /// `p_4`/`gap_4`, both 16px). Used to compute page positions for hit-testing.
 const PAGE_GAP: f32 = 16.0;
@@ -51,7 +56,15 @@ actions!(
     pdf_viewer,
     [
         /// Copy the selected text to the clipboard.
-        CopySelection
+        CopySelection,
+        /// Zoom in.
+        ZoomIn,
+        /// Zoom out.
+        ZoomOut,
+        /// Fit the page width to the viewport.
+        FitWidth,
+        /// Fit the whole page within the viewport.
+        FitPage
     ]
 );
 
@@ -284,12 +297,97 @@ fn extract_glyphs(page: &Page, scale: f32) -> Vec<TextGlyph> {
     sort_reading_order(collector.glyphs)
 }
 
-/// PDF content streams draw glyphs in arbitrary order. Sort them top-to-bottom,
-/// left-to-right so that a contiguous index range corresponds to a visually
-/// contiguous run of text (needed for drag-selection and copy).
-fn sort_reading_order(mut glyphs: Vec<TextGlyph>) -> Vec<TextGlyph> {
+/// Order glyphs for selection/copy. PDF content streams draw glyphs in arbitrary
+/// order, so we recover reading order. Two-column pages are handled region-aware:
+/// rows that span the gutter (titles, author blocks, full-width captions) stay
+/// row-major in place, while the genuinely two-column bands between them are
+/// ordered column-major (left column top-to-bottom, then right). This handles the
+/// common paper layout of a full-width title above a 2-column body. Single-column
+/// pages fall back to plain top-to-bottom, left-to-right order.
+fn sort_reading_order(glyphs: Vec<TextGlyph>) -> Vec<TextGlyph> {
     if glyphs.is_empty() {
         return glyphs;
+    }
+    let page_width = glyphs.iter().map(|g| g.x + g.w).fold(0.0_f32, f32::max);
+    let Some(split) = detect_column_split(&glyphs, page_width) else {
+        return cluster_rows(glyphs).into_iter().flatten().collect();
+    };
+
+    let rows = cluster_rows(glyphs);
+    let mut out: Vec<TextGlyph> = Vec::new();
+    let mut i = 0;
+    while i < rows.len() {
+        if row_spans_gutter(&rows[i], split) {
+            // Full-width row (e.g. the title): keep it as a single row.
+            out.extend(rows[i].iter().cloned());
+            i += 1;
+        } else {
+            // A maximal run of two-column rows: emit the whole left column
+            // (top-to-bottom), then the whole right column.
+            let start = i;
+            while i < rows.len() && !row_spans_gutter(&rows[i], split) {
+                i += 1;
+            }
+            for row in &rows[start..i] {
+                out.extend(row.iter().filter(|g| g.x + g.w / 2.0 < split).cloned());
+            }
+            for row in &rows[start..i] {
+                out.extend(row.iter().filter(|g| g.x + g.w / 2.0 >= split).cloned());
+            }
+        }
+    }
+    out
+}
+
+/// Whether a row has text on both sides of the gutter (a glyph crossing it) — a
+/// full-width line rather than two side-by-side column lines.
+fn row_spans_gutter(row: &[TextGlyph], split: f32) -> bool {
+    row.iter()
+        .any(|g| g.w > 0.0 && g.x < split && g.x + g.w > split)
+}
+
+/// The x of a two-column gutter, if the page has one. Scans the central band for
+/// the x the fewest glyphs straddle and accepts it only if that's nearly empty,
+/// so single-column / figure pages return `None`.
+fn detect_column_split(glyphs: &[TextGlyph], page_width: f32) -> Option<f32> {
+    let total = glyphs.iter().filter(|g| g.w > 0.0).count();
+    if page_width <= 0.0 || total < 300 {
+        return None; // too little text to confidently call it a column layout
+    }
+    let (lo, hi) = (page_width * 0.35, page_width * 0.65);
+    let steps = 48;
+    let mut best_x = lo;
+    let mut best_straddle = usize::MAX;
+    for i in 0..=steps {
+        let x = lo + (hi - lo) * (i as f32 / steps as f32);
+        let straddle = glyphs
+            .iter()
+            .filter(|g| g.w > 0.0 && g.x < x && g.x + g.w > x)
+            .count();
+        if straddle < best_straddle {
+            best_straddle = straddle;
+            best_x = x;
+        }
+    }
+    // Require: (1) the gutter is straddled by almost nothing (a few full-width
+    // lines are ok), and (2) both sides hold substantial text. The balance check
+    // rejects tables (a sparse label column beside a wide content column) and
+    // figure/caption pages, which want row-major order instead.
+    let left = glyphs
+        .iter()
+        .filter(|g| g.w > 0.0 && g.x + g.w / 2.0 < best_x)
+        .count();
+    let right = total - left;
+    let balanced = left.min(right) >= total * 3 / 10;
+    // A real column gutter is straddled by ~nothing (only the odd full-width
+    // line); a table's "gutter" or spurious inter-word alignment straddles more.
+    (best_straddle <= total / 150 && balanced).then_some(best_x)
+}
+
+/// Cluster glyphs into visual rows (top-to-bottom), each row sorted left-to-right.
+fn cluster_rows(mut glyphs: Vec<TextGlyph>) -> Vec<Vec<TextGlyph>> {
+    if glyphs.is_empty() {
+        return Vec::new();
     }
     let cmp_f32 = |a: f32, b: f32| a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal);
     // Line-clustering tolerance: ~70% of the median glyph height.
@@ -299,22 +397,24 @@ fn sort_reading_order(mut glyphs: Vec<TextGlyph>) -> Vec<TextGlyph> {
 
     glyphs.sort_by(|a, b| cmp_f32(a.y, b.y).then(cmp_f32(a.x, b.x)));
 
-    let mut out: Vec<TextGlyph> = Vec::with_capacity(glyphs.len());
-    let mut line: Vec<TextGlyph> = Vec::new();
+    let mut rows: Vec<Vec<TextGlyph>> = Vec::new();
+    let mut row: Vec<TextGlyph> = Vec::new();
     let mut line_y = glyphs[0].y;
     for g in glyphs {
-        if !line.is_empty() && (g.y - line_y) > tol {
-            line.sort_by(|a, b| cmp_f32(a.x, b.x));
-            out.append(&mut line);
+        if !row.is_empty() && (g.y - line_y) > tol {
+            row.sort_by(|a, b| cmp_f32(a.x, b.x));
+            rows.push(std::mem::take(&mut row));
         }
-        if line.is_empty() {
+        if row.is_empty() {
             line_y = g.y;
         }
-        line.push(g);
+        row.push(g);
     }
-    line.sort_by(|a, b| cmp_f32(a.x, b.x));
-    out.append(&mut line);
-    out
+    if !row.is_empty() {
+        row.sort_by(|a, b| cmp_f32(a.x, b.x));
+        rows.push(row);
+    }
+    rows
 }
 
 /// A [`Device`] that records only glyph draws (text + transformed bounds) and
@@ -390,6 +490,10 @@ pub struct PdfView {
     last_mouse: Option<Point<Pixels>>,
     /// Repeating task that auto-scrolls while the cursor is held at an edge.
     autoscroll_task: Option<Task<()>>,
+    /// On-screen page width in px; the zoom level (pages scale to this).
+    display_width: f32,
+    /// Open right-click menu: (menu, click position, dismiss subscription).
+    context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
 }
 
 impl PdfView {
@@ -403,6 +507,74 @@ impl PdfView {
             dragging: false,
             last_mouse: None,
             autoscroll_task: None,
+            display_width: DEFAULT_DISPLAY_WIDTH,
+            context_menu: None,
+        }
+    }
+
+    /// Open a right-click menu (Copy) at the cursor.
+    fn deploy_context_menu(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let position = event.position;
+        let weak = cx.entity().downgrade();
+        let menu = ContextMenu::build(window, cx, move |menu, _, _| {
+            let weak = weak.clone();
+            menu.entry("Copy", None, move |_, cx| {
+                weak.update(cx, |this, cx| {
+                    if let Some(text) = this.selected_text(cx) {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    }
+                })
+                .ok();
+            })
+        });
+        window.focus(&menu.focus_handle(cx), cx);
+        let subscription = cx.subscribe(&menu, |this, _, _: &DismissEvent, cx| {
+            this.context_menu.take();
+            cx.notify();
+        });
+        self.context_menu = Some((menu, position, subscription));
+        cx.notify();
+    }
+
+    fn set_display_width(&mut self, width: f32, cx: &mut Context<Self>) {
+        self.display_width = width.clamp(MIN_DISPLAY_WIDTH, MAX_DISPLAY_WIDTH);
+        cx.notify();
+    }
+
+    fn zoom_in(&mut self, _: &ZoomIn, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_display_width(self.display_width * ZOOM_STEP, cx);
+    }
+
+    fn zoom_out(&mut self, _: &ZoomOut, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_display_width(self.display_width / ZOOM_STEP, cx);
+    }
+
+    /// Scale pages so one page's width fills the viewport.
+    fn fit_width(&mut self, _: &FitWidth, _: &mut Window, cx: &mut Context<Self>) {
+        let viewport_width = f32::from(self.scroll_handle.bounds().size.width);
+        if viewport_width > 0.0 {
+            self.set_display_width(viewport_width - 2.0 * PAGE_GAP, cx);
+        }
+    }
+
+    /// Scale pages so a whole (first) page fits within the viewport.
+    fn fit_page(&mut self, _: &FitPage, _: &mut Window, cx: &mut Context<Self>) {
+        let bounds = self.scroll_handle.bounds();
+        let viewport_width = f32::from(bounds.size.width);
+        let viewport_height = f32::from(bounds.size.height);
+        if let Some(page) = self.pdf_item.read(cx).pages.first()
+            && page.width > 0
+            && viewport_height > 0.0
+        {
+            // height = width * (page_h / page_w); pick width so height fits, and cap to viewport width.
+            let aspect = page.height as f32 / page.width as f32;
+            let width_for_height = (viewport_height - 2.0 * PAGE_GAP) / aspect;
+            self.set_display_width(width_for_height.min(viewport_width - 2.0 * PAGE_GAP), cx);
         }
     }
 
@@ -416,17 +588,22 @@ impl PdfView {
         let pages = &self.pdf_item.read(cx).pages;
         let viewport = self.scroll_handle.bounds();
         let scroll_y = f32::from(self.scroll_handle.offset().y);
+        let scroll_x = f32::from(self.scroll_handle.offset().x);
         let px_pos = f32::from(position.x);
         let py_pos = f32::from(position.y);
+        // Pages are centered when narrower than the viewport, and left-anchored
+        // (horizontally scrollable) when wider — so the centering term is clamped
+        // to >= 0 and the live horizontal scroll offset is added.
         let page_x = f32::from(viewport.origin.x)
-            + (f32::from(viewport.size.width) - DISPLAY_WIDTH) / 2.0;
+            + scroll_x
+            + (f32::from(viewport.size.width) - self.display_width).max(0.0) / 2.0;
         let mut page_y = f32::from(viewport.origin.y) + PAGE_GAP + scroll_y;
 
         for (ix, page) in pages.iter().enumerate() {
-            let scale = DISPLAY_WIDTH / page.width as f32;
+            let scale = self.display_width / page.width as f32;
             let page_h = page.height as f32 * scale;
             if px_pos >= page_x
-                && px_pos <= page_x + DISPLAY_WIDTH
+                && px_pos <= page_x + self.display_width
                 && py_pos >= page_y
                 && py_pos <= page_y + page_h
             {
@@ -596,15 +773,24 @@ impl PdfView {
 /// extent comes from glyphs that have real height (spaces only widen the run).
 /// Returns raster-space rects `(x, y, w, h)`.
 fn selection_runs(glyphs: &[TextGlyph]) -> Vec<(f32, f32, f32, f32)> {
+    let cmp = |a: f32, b: f32| a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal);
+    let mut heights: Vec<f32> = glyphs.iter().map(|g| g.h).filter(|h| *h > 0.0).collect();
+    heights.sort_by(|a, b| cmp(*a, *b));
+    let tol = heights.get(heights.len() / 2).copied().unwrap_or(10.0) * 0.6;
+
     let mut runs = Vec::new();
     let (mut x0, mut y0, mut x1, mut y1) = (0.0f32, f32::MAX, 0.0f32, f32::MIN);
     let mut active = false;
     let mut has_height = false;
     let mut prev_x = f32::MIN;
+    let mut line_y = 0.0f32;
 
     for g in glyphs {
-        if active && g.x < prev_x - 0.5 {
-            // x jumped back to the left margin: end of the current line.
+        // New line when x resets leftward OR the row's y shifts — the latter
+        // catches wrapping and the jump to the top of the next column.
+        let new_line =
+            active && (g.x < prev_x - 0.5 || (g.h > 0.0 && (g.y - line_y).abs() > tol));
+        if new_line {
             if has_height {
                 runs.push((x0, y0, x1 - x0, y1 - y0));
             }
@@ -612,6 +798,7 @@ fn selection_runs(glyphs: &[TextGlyph]) -> Vec<(f32, f32, f32, f32)> {
         }
         if !active {
             (x0, x1, y0, y1, has_height, active) = (g.x, g.x + g.w, f32::MAX, f32::MIN, false, true);
+            line_y = g.y;
         } else {
             x0 = x0.min(g.x);
             x1 = x1.max(g.x + g.w);
@@ -626,7 +813,14 @@ fn selection_runs(glyphs: &[TextGlyph]) -> Vec<(f32, f32, f32, f32)> {
     if active && has_height {
         runs.push((x0, y0, x1 - x0, y1 - y0));
     }
-    runs
+    // Pad each bar vertically so consecutive lines' highlights touch (fills the
+    // line leading), matching a normal editor's contiguous selection.
+    runs.into_iter()
+        .map(|(x, y, w, h)| {
+            let pad = h * 0.12;
+            (x, y - pad, w, h + 2.0 * pad)
+        })
+        .collect()
 }
 
 /// Index of the glyph containing (rx, ry) in raster space, else nearest by center.
@@ -716,6 +910,12 @@ impl Render for PdfView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pages = self.pdf_item.read(cx).pages.clone();
         let selection = self.selection;
+        let display_width = self.display_width;
+        // Column width = max(viewport, page) so it grows past the viewport when
+        // zoomed (→ horizontal scroll); vertical-only padding keeps hit-test x math
+        // exact. viewport width comes from the prior frame's scroll bounds.
+        let viewport_width = f32::from(self.scroll_handle.bounds().size.width);
+        let content_width = display_width.max(viewport_width);
         // Global glyph offset of each page (for mapping the cross-page selection
         // range onto each page's local glyph slice).
         let mut page_offsets = Vec::with_capacity(pages.len());
@@ -725,18 +925,18 @@ impl Render for PdfView {
             acc += page.glyphs.len();
         }
 
-        let weak = cx.entity().downgrade();
-        // The page column is the right-click trigger; the scroll container stays
-        // outside it so scroll-wheel/track_scroll keep working (mirrors how
-        // markdown_preview wraps only its content, not the scroll area).
+        // The page column is the scroll container's direct child (no wrapper) so
+        // it can grow wider than the viewport when zoomed → horizontal scroll.
         let pages_column = div()
             .flex()
             .flex_col()
             .items_center()
+            .flex_shrink_0()
+            .w(px(content_width))
             .gap_4()
-            .p_4()
+            .py_4()
             .children(pages.iter().enumerate().map(|(ix, page)| {
-                        let scale = DISPLAY_WIDTH / page.width as f32;
+                        let scale = display_width / page.width as f32;
                         let start = page_offsets[ix];
                         let end = start + page.glyphs.len();
                         let highlights = selection
@@ -780,7 +980,7 @@ impl Render for PdfView {
                         div()
                             .id(("pdf-page", ix))
                             .relative()
-                            .w(px(DISPLAY_WIDTH))
+                            .w(px(display_width))
                             .h(px(page.height as f32 * scale))
                             .shadow_md()
                             .child(img(page.image.clone()).size_full())
@@ -788,27 +988,45 @@ impl Render for PdfView {
                             .children(link_overlays)
             }));
 
-        let content = right_click_menu("pdf-context-menu")
-            .trigger(move |_, _, _| pages_column)
-            .menu(move |window, cx| {
-                let weak = weak.clone();
-                ContextMenu::build(window, cx, move |menu, _, _| {
-                    let weak = weak.clone();
-                    menu.entry("Copy", None, move |_, cx| {
-                        weak.update(cx, |this, cx| {
-                            if let Some(text) = this.selected_text(cx) {
-                                cx.write_to_clipboard(ClipboardItem::new_string(text));
-                            }
-                        })
-                        .ok();
-                    })
-                })
-            });
+        let controls = h_flex()
+            .occlude() // don't let toolbar clicks fall through to the document
+            .absolute()
+            .top_2()
+            .right_2()
+            .gap_1()
+            .p_1()
+            .rounded_md()
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .bg(cx.theme().colors().elevated_surface_background)
+            .shadow_md()
+            .child(
+                IconButton::new("pdf-zoom-out", IconName::Dash)
+                    .on_click(cx.listener(|this, _, window, cx| this.zoom_out(&ZoomOut, window, cx))),
+            )
+            .child(
+                IconButton::new("pdf-zoom-in", IconName::Plus)
+                    .on_click(cx.listener(|this, _, window, cx| this.zoom_in(&ZoomIn, window, cx))),
+            )
+            .child(
+                Button::new("pdf-fit-width", "Fit width").on_click(
+                    cx.listener(|this, _, window, cx| this.fit_width(&FitWidth, window, cx)),
+                ),
+            )
+            .child(
+                Button::new("pdf-fit-page", "Fit page")
+                    .on_click(cx.listener(|this, _, window, cx| this.fit_page(&FitPage, window, cx))),
+            );
 
         div()
             .track_focus(&self.focus_handle)
             .key_context("PdfViewer")
+            .relative()
             .on_action(cx.listener(Self::copy))
+            .on_action(cx.listener(Self::zoom_in))
+            .on_action(cx.listener(Self::zoom_out))
+            .on_action(cx.listener(Self::fit_width))
+            .on_action(cx.listener(Self::fit_page))
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .child(
@@ -816,12 +1034,23 @@ impl Render for PdfView {
                     .id("pdf-scroll")
                     .track_scroll(&self.scroll_handle)
                     .size_full()
-                    .overflow_y_scroll()
+                    .overflow_scroll()
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+                    .on_mouse_down(MouseButton::Right, cx.listener(Self::deploy_context_menu))
                     .on_mouse_move(cx.listener(Self::on_mouse_move))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
-                    .child(content),
+                    .child(pages_column),
             )
+            .child(controls)
+            .children(self.context_menu.as_ref().map(|(menu, position, _)| {
+                deferred(
+                    anchored()
+                        .position(*position)
+                        .anchor(gpui::Anchor::TopLeft)
+                        .child(menu.clone()),
+                )
+                .with_priority(1)
+            }))
     }
 }
 
