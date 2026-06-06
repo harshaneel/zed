@@ -1,0 +1,36 @@
+[package]
+name = "pdf_viewer"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/pdf_viewer.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+gpui.workspace = true
+hayro = { version = "0.7", default-features = false, features = ["embed-fonts"] }
+image.workspace = true
+log.workspace = true
+project.workspace = true
+smallvec.workspace = true
+ui.workspace = true
+util.workspace = true
+workspace.workspace = true
+
+[dev-dependencies]
+fs = { workspace = true, features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+serde_json.workspace = true
+settings = { workspace = true, features = ["test-support"] }
+util = { workspace = true, features = ["test-support"] }
+# project/test-support pulls remote/test-support (adds RemoteConnectionIdentity::Mock);
+# workspace's arm for it is gated on workspace/test-support, so enable it to match.
+workspace = { workspace = true, features = ["test-support"] }
