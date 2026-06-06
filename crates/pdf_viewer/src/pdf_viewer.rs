@@ -297,12 +297,97 @@ fn extract_glyphs(page: &Page, scale: f32) -> Vec<TextGlyph> {
     sort_reading_order(collector.glyphs)
 }
 
-/// PDF content streams draw glyphs in arbitrary order. Sort them top-to-bottom,
-/// left-to-right so that a contiguous index range corresponds to a visually
-/// contiguous run of text (needed for drag-selection and copy).
-fn sort_reading_order(mut glyphs: Vec<TextGlyph>) -> Vec<TextGlyph> {
+/// Order glyphs for selection/copy. PDF content streams draw glyphs in arbitrary
+/// order, so we recover reading order. Two-column pages are handled region-aware:
+/// rows that span the gutter (titles, author blocks, full-width captions) stay
+/// row-major in place, while the genuinely two-column bands between them are
+/// ordered column-major (left column top-to-bottom, then right). This handles the
+/// common paper layout of a full-width title above a 2-column body. Single-column
+/// pages fall back to plain top-to-bottom, left-to-right order.
+fn sort_reading_order(glyphs: Vec<TextGlyph>) -> Vec<TextGlyph> {
     if glyphs.is_empty() {
         return glyphs;
+    }
+    let page_width = glyphs.iter().map(|g| g.x + g.w).fold(0.0_f32, f32::max);
+    let Some(split) = detect_column_split(&glyphs, page_width) else {
+        return cluster_rows(glyphs).into_iter().flatten().collect();
+    };
+
+    let rows = cluster_rows(glyphs);
+    let mut out: Vec<TextGlyph> = Vec::new();
+    let mut i = 0;
+    while i < rows.len() {
+        if row_spans_gutter(&rows[i], split) {
+            // Full-width row (e.g. the title): keep it as a single row.
+            out.extend(rows[i].iter().cloned());
+            i += 1;
+        } else {
+            // A maximal run of two-column rows: emit the whole left column
+            // (top-to-bottom), then the whole right column.
+            let start = i;
+            while i < rows.len() && !row_spans_gutter(&rows[i], split) {
+                i += 1;
+            }
+            for row in &rows[start..i] {
+                out.extend(row.iter().filter(|g| g.x + g.w / 2.0 < split).cloned());
+            }
+            for row in &rows[start..i] {
+                out.extend(row.iter().filter(|g| g.x + g.w / 2.0 >= split).cloned());
+            }
+        }
+    }
+    out
+}
+
+/// Whether a row has text on both sides of the gutter (a glyph crossing it) — a
+/// full-width line rather than two side-by-side column lines.
+fn row_spans_gutter(row: &[TextGlyph], split: f32) -> bool {
+    row.iter()
+        .any(|g| g.w > 0.0 && g.x < split && g.x + g.w > split)
+}
+
+/// The x of a two-column gutter, if the page has one. Scans the central band for
+/// the x the fewest glyphs straddle and accepts it only if that's nearly empty,
+/// so single-column / figure pages return `None`.
+fn detect_column_split(glyphs: &[TextGlyph], page_width: f32) -> Option<f32> {
+    let total = glyphs.iter().filter(|g| g.w > 0.0).count();
+    if page_width <= 0.0 || total < 300 {
+        return None; // too little text to confidently call it a column layout
+    }
+    let (lo, hi) = (page_width * 0.35, page_width * 0.65);
+    let steps = 48;
+    let mut best_x = lo;
+    let mut best_straddle = usize::MAX;
+    for i in 0..=steps {
+        let x = lo + (hi - lo) * (i as f32 / steps as f32);
+        let straddle = glyphs
+            .iter()
+            .filter(|g| g.w > 0.0 && g.x < x && g.x + g.w > x)
+            .count();
+        if straddle < best_straddle {
+            best_straddle = straddle;
+            best_x = x;
+        }
+    }
+    // Require: (1) the gutter is straddled by almost nothing (a few full-width
+    // lines are ok), and (2) both sides hold substantial text. The balance check
+    // rejects tables (a sparse label column beside a wide content column) and
+    // figure/caption pages, which want row-major order instead.
+    let left = glyphs
+        .iter()
+        .filter(|g| g.w > 0.0 && g.x + g.w / 2.0 < best_x)
+        .count();
+    let right = total - left;
+    let balanced = left.min(right) >= total * 3 / 10;
+    // A real column gutter is straddled by ~nothing (only the odd full-width
+    // line); a table's "gutter" or spurious inter-word alignment straddles more.
+    (best_straddle <= total / 150 && balanced).then_some(best_x)
+}
+
+/// Cluster glyphs into visual rows (top-to-bottom), each row sorted left-to-right.
+fn cluster_rows(mut glyphs: Vec<TextGlyph>) -> Vec<Vec<TextGlyph>> {
+    if glyphs.is_empty() {
+        return Vec::new();
     }
     let cmp_f32 = |a: f32, b: f32| a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal);
     // Line-clustering tolerance: ~70% of the median glyph height.
@@ -312,22 +397,24 @@ fn sort_reading_order(mut glyphs: Vec<TextGlyph>) -> Vec<TextGlyph> {
 
     glyphs.sort_by(|a, b| cmp_f32(a.y, b.y).then(cmp_f32(a.x, b.x)));
 
-    let mut out: Vec<TextGlyph> = Vec::with_capacity(glyphs.len());
-    let mut line: Vec<TextGlyph> = Vec::new();
+    let mut rows: Vec<Vec<TextGlyph>> = Vec::new();
+    let mut row: Vec<TextGlyph> = Vec::new();
     let mut line_y = glyphs[0].y;
     for g in glyphs {
-        if !line.is_empty() && (g.y - line_y) > tol {
-            line.sort_by(|a, b| cmp_f32(a.x, b.x));
-            out.append(&mut line);
+        if !row.is_empty() && (g.y - line_y) > tol {
+            row.sort_by(|a, b| cmp_f32(a.x, b.x));
+            rows.push(std::mem::take(&mut row));
         }
-        if line.is_empty() {
+        if row.is_empty() {
             line_y = g.y;
         }
-        line.push(g);
+        row.push(g);
     }
-    line.sort_by(|a, b| cmp_f32(a.x, b.x));
-    out.append(&mut line);
-    out
+    if !row.is_empty() {
+        row.sort_by(|a, b| cmp_f32(a.x, b.x));
+        rows.push(row);
+    }
+    rows
 }
 
 /// A [`Device`] that records only glyph draws (text + transformed bounds) and
@@ -686,15 +773,24 @@ impl PdfView {
 /// extent comes from glyphs that have real height (spaces only widen the run).
 /// Returns raster-space rects `(x, y, w, h)`.
 fn selection_runs(glyphs: &[TextGlyph]) -> Vec<(f32, f32, f32, f32)> {
+    let cmp = |a: f32, b: f32| a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal);
+    let mut heights: Vec<f32> = glyphs.iter().map(|g| g.h).filter(|h| *h > 0.0).collect();
+    heights.sort_by(|a, b| cmp(*a, *b));
+    let tol = heights.get(heights.len() / 2).copied().unwrap_or(10.0) * 0.6;
+
     let mut runs = Vec::new();
     let (mut x0, mut y0, mut x1, mut y1) = (0.0f32, f32::MAX, 0.0f32, f32::MIN);
     let mut active = false;
     let mut has_height = false;
     let mut prev_x = f32::MIN;
+    let mut line_y = 0.0f32;
 
     for g in glyphs {
-        if active && g.x < prev_x - 0.5 {
-            // x jumped back to the left margin: end of the current line.
+        // New line when x resets leftward OR the row's y shifts — the latter
+        // catches wrapping and the jump to the top of the next column.
+        let new_line =
+            active && (g.x < prev_x - 0.5 || (g.h > 0.0 && (g.y - line_y).abs() > tol));
+        if new_line {
             if has_height {
                 runs.push((x0, y0, x1 - x0, y1 - y0));
             }
@@ -702,6 +798,7 @@ fn selection_runs(glyphs: &[TextGlyph]) -> Vec<(f32, f32, f32, f32)> {
         }
         if !active {
             (x0, x1, y0, y1, has_height, active) = (g.x, g.x + g.w, f32::MAX, f32::MIN, false, true);
+            line_y = g.y;
         } else {
             x0 = x0.min(g.x);
             x1 = x1.max(g.x + g.w);
@@ -716,7 +813,14 @@ fn selection_runs(glyphs: &[TextGlyph]) -> Vec<(f32, f32, f32, f32)> {
     if active && has_height {
         runs.push((x0, y0, x1 - x0, y1 - y0));
     }
-    runs
+    // Pad each bar vertically so consecutive lines' highlights touch (fills the
+    // line leading), matching a normal editor's contiguous selection.
+    runs.into_iter()
+        .map(|(x, y, w, h)| {
+            let pad = h * 0.12;
+            (x, y - pad, w, h + 2.0 * pad)
+        })
+        .collect()
 }
 
 /// Index of the glyph containing (rx, ry) in raster space, else nearest by center.
