@@ -12,10 +12,10 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow};
 use gpui::{
-    App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
-    Point, Render, RenderImage, ScrollHandle, SharedString, Styled, Task, Window, actions, div, img,
-    px, rgba,
+    App, ClipboardItem, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
+    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
+    Point, Render, RenderImage, ScrollHandle, SharedString, Styled, Subscription, Task, Window,
+    actions, anchored, deferred, div, img, px, rgba,
 };
 use hayro::hayro_interpret::font::Glyph;
 use hayro::hayro_interpret::hayro_cmap::BfString;
@@ -32,8 +32,8 @@ use hayro::{RenderCache, RenderSettings, render};
 use image::{Frame, RgbaImage};
 use project::{Project, ProjectEntryId, ProjectPath};
 use smallvec::smallvec;
+use ui::ContextMenu;
 use ui::prelude::*;
-use ui::{ContextMenu, right_click_menu};
 use workspace::{
     Pane,
     item::{Item, ProjectItem},
@@ -41,8 +41,13 @@ use workspace::{
 
 /// Width each page is rasterized to, in pixels. Higher = sharper but heavier.
 const RASTER_WIDTH: f32 = 1600.0;
-/// On-screen page width (the rendered bitmap is scaled to this).
-const DISPLAY_WIDTH: f32 = 900.0;
+/// Default on-screen page width before any zoom (bitmap is scaled to this).
+const DEFAULT_DISPLAY_WIDTH: f32 = 900.0;
+/// Clamp range for the zoomable on-screen page width.
+const MIN_DISPLAY_WIDTH: f32 = 200.0;
+const MAX_DISPLAY_WIDTH: f32 = 4000.0;
+/// Multiplicative zoom step.
+const ZOOM_STEP: f32 = 1.2;
 /// Vertical gap above the first page and between pages (matches the render's
 /// `p_4`/`gap_4`, both 16px). Used to compute page positions for hit-testing.
 const PAGE_GAP: f32 = 16.0;
@@ -51,7 +56,15 @@ actions!(
     pdf_viewer,
     [
         /// Copy the selected text to the clipboard.
-        CopySelection
+        CopySelection,
+        /// Zoom in.
+        ZoomIn,
+        /// Zoom out.
+        ZoomOut,
+        /// Fit the page width to the viewport.
+        FitWidth,
+        /// Fit the whole page within the viewport.
+        FitPage
     ]
 );
 
@@ -390,6 +403,10 @@ pub struct PdfView {
     last_mouse: Option<Point<Pixels>>,
     /// Repeating task that auto-scrolls while the cursor is held at an edge.
     autoscroll_task: Option<Task<()>>,
+    /// On-screen page width in px; the zoom level (pages scale to this).
+    display_width: f32,
+    /// Open right-click menu: (menu, click position, dismiss subscription).
+    context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
 }
 
 impl PdfView {
@@ -403,6 +420,74 @@ impl PdfView {
             dragging: false,
             last_mouse: None,
             autoscroll_task: None,
+            display_width: DEFAULT_DISPLAY_WIDTH,
+            context_menu: None,
+        }
+    }
+
+    /// Open a right-click menu (Copy) at the cursor.
+    fn deploy_context_menu(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let position = event.position;
+        let weak = cx.entity().downgrade();
+        let menu = ContextMenu::build(window, cx, move |menu, _, _| {
+            let weak = weak.clone();
+            menu.entry("Copy", None, move |_, cx| {
+                weak.update(cx, |this, cx| {
+                    if let Some(text) = this.selected_text(cx) {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    }
+                })
+                .ok();
+            })
+        });
+        window.focus(&menu.focus_handle(cx), cx);
+        let subscription = cx.subscribe(&menu, |this, _, _: &DismissEvent, cx| {
+            this.context_menu.take();
+            cx.notify();
+        });
+        self.context_menu = Some((menu, position, subscription));
+        cx.notify();
+    }
+
+    fn set_display_width(&mut self, width: f32, cx: &mut Context<Self>) {
+        self.display_width = width.clamp(MIN_DISPLAY_WIDTH, MAX_DISPLAY_WIDTH);
+        cx.notify();
+    }
+
+    fn zoom_in(&mut self, _: &ZoomIn, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_display_width(self.display_width * ZOOM_STEP, cx);
+    }
+
+    fn zoom_out(&mut self, _: &ZoomOut, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_display_width(self.display_width / ZOOM_STEP, cx);
+    }
+
+    /// Scale pages so one page's width fills the viewport.
+    fn fit_width(&mut self, _: &FitWidth, _: &mut Window, cx: &mut Context<Self>) {
+        let viewport_width = f32::from(self.scroll_handle.bounds().size.width);
+        if viewport_width > 0.0 {
+            self.set_display_width(viewport_width - 2.0 * PAGE_GAP, cx);
+        }
+    }
+
+    /// Scale pages so a whole (first) page fits within the viewport.
+    fn fit_page(&mut self, _: &FitPage, _: &mut Window, cx: &mut Context<Self>) {
+        let bounds = self.scroll_handle.bounds();
+        let viewport_width = f32::from(bounds.size.width);
+        let viewport_height = f32::from(bounds.size.height);
+        if let Some(page) = self.pdf_item.read(cx).pages.first()
+            && page.width > 0
+            && viewport_height > 0.0
+        {
+            // height = width * (page_h / page_w); pick width so height fits, and cap to viewport width.
+            let aspect = page.height as f32 / page.width as f32;
+            let width_for_height = (viewport_height - 2.0 * PAGE_GAP) / aspect;
+            self.set_display_width(width_for_height.min(viewport_width - 2.0 * PAGE_GAP), cx);
         }
     }
 
@@ -416,17 +501,22 @@ impl PdfView {
         let pages = &self.pdf_item.read(cx).pages;
         let viewport = self.scroll_handle.bounds();
         let scroll_y = f32::from(self.scroll_handle.offset().y);
+        let scroll_x = f32::from(self.scroll_handle.offset().x);
         let px_pos = f32::from(position.x);
         let py_pos = f32::from(position.y);
+        // Pages are centered when narrower than the viewport, and left-anchored
+        // (horizontally scrollable) when wider — so the centering term is clamped
+        // to >= 0 and the live horizontal scroll offset is added.
         let page_x = f32::from(viewport.origin.x)
-            + (f32::from(viewport.size.width) - DISPLAY_WIDTH) / 2.0;
+            + scroll_x
+            + (f32::from(viewport.size.width) - self.display_width).max(0.0) / 2.0;
         let mut page_y = f32::from(viewport.origin.y) + PAGE_GAP + scroll_y;
 
         for (ix, page) in pages.iter().enumerate() {
-            let scale = DISPLAY_WIDTH / page.width as f32;
+            let scale = self.display_width / page.width as f32;
             let page_h = page.height as f32 * scale;
             if px_pos >= page_x
-                && px_pos <= page_x + DISPLAY_WIDTH
+                && px_pos <= page_x + self.display_width
                 && py_pos >= page_y
                 && py_pos <= page_y + page_h
             {
@@ -716,6 +806,12 @@ impl Render for PdfView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pages = self.pdf_item.read(cx).pages.clone();
         let selection = self.selection;
+        let display_width = self.display_width;
+        // Column width = max(viewport, page) so it grows past the viewport when
+        // zoomed (→ horizontal scroll); vertical-only padding keeps hit-test x math
+        // exact. viewport width comes from the prior frame's scroll bounds.
+        let viewport_width = f32::from(self.scroll_handle.bounds().size.width);
+        let content_width = display_width.max(viewport_width);
         // Global glyph offset of each page (for mapping the cross-page selection
         // range onto each page's local glyph slice).
         let mut page_offsets = Vec::with_capacity(pages.len());
@@ -725,18 +821,18 @@ impl Render for PdfView {
             acc += page.glyphs.len();
         }
 
-        let weak = cx.entity().downgrade();
-        // The page column is the right-click trigger; the scroll container stays
-        // outside it so scroll-wheel/track_scroll keep working (mirrors how
-        // markdown_preview wraps only its content, not the scroll area).
+        // The page column is the scroll container's direct child (no wrapper) so
+        // it can grow wider than the viewport when zoomed → horizontal scroll.
         let pages_column = div()
             .flex()
             .flex_col()
             .items_center()
+            .flex_shrink_0()
+            .w(px(content_width))
             .gap_4()
-            .p_4()
+            .py_4()
             .children(pages.iter().enumerate().map(|(ix, page)| {
-                        let scale = DISPLAY_WIDTH / page.width as f32;
+                        let scale = display_width / page.width as f32;
                         let start = page_offsets[ix];
                         let end = start + page.glyphs.len();
                         let highlights = selection
@@ -780,7 +876,7 @@ impl Render for PdfView {
                         div()
                             .id(("pdf-page", ix))
                             .relative()
-                            .w(px(DISPLAY_WIDTH))
+                            .w(px(display_width))
                             .h(px(page.height as f32 * scale))
                             .shadow_md()
                             .child(img(page.image.clone()).size_full())
@@ -788,27 +884,45 @@ impl Render for PdfView {
                             .children(link_overlays)
             }));
 
-        let content = right_click_menu("pdf-context-menu")
-            .trigger(move |_, _, _| pages_column)
-            .menu(move |window, cx| {
-                let weak = weak.clone();
-                ContextMenu::build(window, cx, move |menu, _, _| {
-                    let weak = weak.clone();
-                    menu.entry("Copy", None, move |_, cx| {
-                        weak.update(cx, |this, cx| {
-                            if let Some(text) = this.selected_text(cx) {
-                                cx.write_to_clipboard(ClipboardItem::new_string(text));
-                            }
-                        })
-                        .ok();
-                    })
-                })
-            });
+        let controls = h_flex()
+            .occlude() // don't let toolbar clicks fall through to the document
+            .absolute()
+            .top_2()
+            .right_2()
+            .gap_1()
+            .p_1()
+            .rounded_md()
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .bg(cx.theme().colors().elevated_surface_background)
+            .shadow_md()
+            .child(
+                IconButton::new("pdf-zoom-out", IconName::Dash)
+                    .on_click(cx.listener(|this, _, window, cx| this.zoom_out(&ZoomOut, window, cx))),
+            )
+            .child(
+                IconButton::new("pdf-zoom-in", IconName::Plus)
+                    .on_click(cx.listener(|this, _, window, cx| this.zoom_in(&ZoomIn, window, cx))),
+            )
+            .child(
+                Button::new("pdf-fit-width", "Fit width").on_click(
+                    cx.listener(|this, _, window, cx| this.fit_width(&FitWidth, window, cx)),
+                ),
+            )
+            .child(
+                Button::new("pdf-fit-page", "Fit page")
+                    .on_click(cx.listener(|this, _, window, cx| this.fit_page(&FitPage, window, cx))),
+            );
 
         div()
             .track_focus(&self.focus_handle)
             .key_context("PdfViewer")
+            .relative()
             .on_action(cx.listener(Self::copy))
+            .on_action(cx.listener(Self::zoom_in))
+            .on_action(cx.listener(Self::zoom_out))
+            .on_action(cx.listener(Self::fit_width))
+            .on_action(cx.listener(Self::fit_page))
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .child(
@@ -816,12 +930,23 @@ impl Render for PdfView {
                     .id("pdf-scroll")
                     .track_scroll(&self.scroll_handle)
                     .size_full()
-                    .overflow_y_scroll()
+                    .overflow_scroll()
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+                    .on_mouse_down(MouseButton::Right, cx.listener(Self::deploy_context_menu))
                     .on_mouse_move(cx.listener(Self::on_mouse_move))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
-                    .child(content),
+                    .child(pages_column),
             )
+            .child(controls)
+            .children(self.context_menu.as_ref().map(|(menu, position, _)| {
+                deferred(
+                    anchored()
+                        .position(*position)
+                        .anchor(gpui::Anchor::TopLeft)
+                        .child(menu.clone()),
+                )
+                .with_priority(1)
+            }))
     }
 }
 

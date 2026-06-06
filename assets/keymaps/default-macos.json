@@ -2,7 +2,12 @@
   {
     "context": "PdfViewer",
     "bindings": {
-      "cmd-c": "pdf_viewer::CopySelection"
+      "cmd-c": "pdf_viewer::CopySelection",
+      "cmd-=": "pdf_viewer::ZoomIn",
+      "cmd-+": "pdf_viewer::ZoomIn",
+      "cmd--": "pdf_viewer::ZoomOut",
+      "cmd-0": "pdf_viewer::FitWidth",
+      "cmd-9": "pdf_viewer::FitPage"
     }
   },
   // Standard macOS bindings
