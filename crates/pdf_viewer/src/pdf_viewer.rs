@@ -873,6 +873,34 @@ fn nearest_glyph(glyphs: &[TextGlyph], rx: f32, ry: f32) -> usize {
     best
 }
 
+/// Options for in-document find. `case_sensitive`/`whole_word` are user toggles.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct FindOptions {
+    case_sensitive: bool,
+    whole_word: bool,
+}
+
+/// A match within one page, as a page-local glyph range `[start_glyph, end_glyph)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FindMatch {
+    page_ix: usize,
+    start_glyph: usize,
+    end_glyph: usize,
+}
+
+/// Concatenate a page's glyph texts in reading order, recording the byte offset
+/// at which each glyph's text begins, so a match byte-range can be mapped back to
+/// the glyphs that produced it.
+fn page_search_text(glyphs: &[TextGlyph]) -> (String, Vec<usize>) {
+    let mut text = String::new();
+    let mut starts = Vec::with_capacity(glyphs.len());
+    for g in glyphs {
+        starts.push(text.len());
+        text.push_str(&g.text);
+    }
+    (text, starts)
+}
+
 impl EventEmitter<()> for PdfView {}
 
 impl Focusable for PdfView {
@@ -1134,6 +1162,20 @@ mod tests {
     /// Integration: against a real `Project`, `try_open` claims `.pdf` paths and
     /// declines others. Checks only the (synchronous) routing decision, so it
     /// needs neither a real file nor a rasterizer — the rasterization task is dropped.
+    /// Build a `TextGlyph` with the given text; geometry is irrelevant to the
+    /// search engine (only glyph counts/order matter for index mapping).
+    fn tg(text: &str) -> TextGlyph {
+        TextGlyph { text: text.to_string(), x: 0.0, y: 0.0, w: 1.0, h: 1.0 }
+    }
+
+    #[test]
+    fn test_page_search_text_offsets() {
+        let glyphs = vec![tg("He"), tg("llo"), tg(" "), tg("wörld")];
+        let (text, starts) = page_search_text(&glyphs);
+        assert_eq!(text, "Hello wörld");
+        assert_eq!(starts, vec![0, 2, 5, 6]);
+    }
+
     #[gpui::test]
     async fn test_try_open_routes_only_pdfs(cx: &mut TestAppContext) {
         init_test(cx);
