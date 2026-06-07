@@ -573,6 +573,10 @@ impl PdfView {
 
     fn set_display_width(&mut self, width: f32, cx: &mut Context<Self>) {
         self.display_width = width.clamp(MIN_DISPLAY_WIDTH, MAX_DISPLAY_WIDTH);
+        // Zoom changes page scale; keep the current find match centered.
+        if self.find.current.is_some() {
+            self.scroll_current_match_into_view(cx);
+        }
         cx.notify();
     }
 
@@ -677,8 +681,12 @@ impl PdfView {
             return;
         }
         // Take focus so the `cmd-c` binding (scoped to the PdfViewer key context)
-        // dispatches to this view.
-        window.focus(&self.focus_handle, cx);
+        // dispatches to this view. While the find bar is open it owns keyboard
+        // focus (so typing keeps editing the query); don't steal it back on a
+        // document click, or the query input would silently stop responding.
+        if !self.find.active {
+            window.focus(&self.focus_handle, cx);
+        }
         self.last_mouse = Some(event.position);
         if let Some(g) = self.glyph_at(event.position, cx) {
             self.selection = Some(Selection { anchor: g, head: g });
@@ -1601,6 +1609,15 @@ mod tests {
         let opts = FindOptions { case_sensitive: false, whole_word: true };
         let m = find_in_glyphs(&glyphs, "cat", opts);
         assert_eq!(m.len(), 1, "'cat' is whole-word bounded by the space in glyph 1");
+    }
+
+    #[test]
+    fn test_find_adjacent_matches_are_non_overlapping() {
+        // "aa" over "aaaa" yields non-overlapping matches at 0-1 and 2-3, not three
+        // overlapping ones (matches standard find behavior).
+        let glyphs = vec![tg("a"), tg("a"), tg("a"), tg("a")];
+        let m = find_in_glyphs(&glyphs, "aa", FindOptions::default());
+        assert_eq!(m, vec![(0, 2), (2, 4)]);
     }
 
     #[test]
