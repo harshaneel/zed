@@ -33,6 +33,7 @@ use image::{Frame, RgbaImage};
 use project::{Project, ProjectEntryId, ProjectPath};
 use smallvec::smallvec;
 use ui::ContextMenu;
+use ui::Tooltip;
 use ui::prelude::*;
 use workspace::{
     Pane,
@@ -1219,6 +1220,12 @@ impl Render for PdfView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pages = self.pdf_item.read(cx).pages.clone();
         let selection = self.selection;
+        let find_matches = if self.find.active {
+            self.find.matches.clone()
+        } else {
+            Vec::new()
+        };
+        let find_current = self.find.current;
         let display_width = self.display_width;
         // Column width = max(viewport, page) so it grows past the viewport when
         // zoomed (→ horizontal scroll); vertical-only padding keeps hit-test x math
@@ -1286,6 +1293,28 @@ impl Render for PdfView {
                                 .cursor_pointer()
                         });
 
+                        let find_matches = &find_matches;
+                        let match_highlights = find_matches
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, m)| m.page_ix == ix)
+                            .flat_map(|(mi, m)| {
+                                let end = m.end_glyph.min(page.glyphs.len());
+                                let slice = &page.glyphs[m.start_glyph.min(end)..end];
+                                let strong = find_current == Some(mi);
+                                selection_runs(slice).into_iter().map(move |(x, y, w, h)| {
+                                    div()
+                                        .absolute()
+                                        .left(px(x * scale))
+                                        .top(px(y * scale))
+                                        .w(px(w * scale))
+                                        .h(px(h * scale))
+                                        .rounded_sm()
+                                        .bg(if strong { rgba(0xf59e0bcc) } else { rgba(0xfde68a80) })
+                                })
+                            })
+                            .collect::<Vec<_>>();
+
                         div()
                             .id(("pdf-page", ix))
                             .relative()
@@ -1295,6 +1324,7 @@ impl Render for PdfView {
                             .child(img(page.image.clone()).size_full())
                             .children(highlights)
                             .children(link_overlays)
+                            .children(match_highlights)
             }));
 
         let controls = h_flex()
@@ -1327,6 +1357,93 @@ impl Render for PdfView {
                     .on_click(cx.listener(|this, _, window, cx| this.fit_page(&FitPage, window, cx))),
             );
 
+        let find_bar = self.find.active.then(|| {
+            let counter = if self.find.query.is_empty() {
+                String::new()
+            } else if self.find.matches.is_empty() {
+                "No results".to_owned()
+            } else {
+                let pos = self.find.current.map(|c| c + 1).unwrap_or(0);
+                format!("{} of {}", pos, self.find.matches.len())
+            };
+            let query_label = if self.find.query.is_empty() {
+                "Find".to_owned()
+            } else {
+                self.find.query.clone()
+            };
+            let case_on = self.find.options.case_sensitive;
+            let word_on = self.find.options.whole_word;
+
+            h_flex()
+                .occlude()
+                .track_focus(&self.find_focus_handle)
+                .key_context("PdfFind")
+                .on_action(cx.listener(Self::dismiss_find))
+                .on_action(cx.listener(Self::select_next_match))
+                .on_action(cx.listener(Self::select_prev_match))
+                .on_key_down(cx.listener(Self::on_find_key))
+                .absolute()
+                .top_2()
+                .left_2()
+                .gap_1()
+                .p_1()
+                .rounded_md()
+                .border_1()
+                .border_color(cx.theme().colors().border)
+                .bg(cx.theme().colors().elevated_surface_background)
+                .shadow_md()
+                .child(
+                    div()
+                        .min_w(px(160.0))
+                        .px_2()
+                        .rounded_sm()
+                        .bg(cx.theme().colors().editor_background)
+                        .child(Label::new(query_label).color(if self.find.query.is_empty() {
+                            Color::Muted
+                        } else {
+                            Color::Default
+                        })),
+                )
+                .child(
+                    IconButton::new("pdf-find-case", IconName::CaseSensitive)
+                        .toggle_state(case_on)
+                        .tooltip(Tooltip::text("Match case"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.toggle_case_sensitive(&ToggleCaseSensitive, window, cx)
+                        })),
+                )
+                .child(
+                    IconButton::new("pdf-find-word", IconName::WholeWord)
+                        .toggle_state(word_on)
+                        .tooltip(Tooltip::text("Whole word"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.toggle_whole_word(&ToggleWholeWord, window, cx)
+                        })),
+                )
+                .child(Label::new(counter).color(Color::Muted))
+                .child(
+                    IconButton::new("pdf-find-prev", IconName::ChevronUp)
+                        .tooltip(Tooltip::text("Previous match"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.select_prev_match(&SelectPrevMatch, window, cx)
+                        })),
+                )
+                .child(
+                    IconButton::new("pdf-find-next", IconName::ChevronDown)
+                        .tooltip(Tooltip::text("Next match"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.select_next_match(&SelectNextMatch, window, cx)
+                        })),
+                )
+                .child(
+                    IconButton::new("pdf-find-close", IconName::Close)
+                        .tooltip(Tooltip::text("Close"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.dismiss_find(&DismissFind, window, cx)
+                        })),
+                )
+        });
+
         div()
             .track_focus(&self.focus_handle)
             .key_context("PdfViewer")
@@ -1336,6 +1453,7 @@ impl Render for PdfView {
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::fit_width))
             .on_action(cx.listener(Self::fit_page))
+            .on_action(cx.listener(Self::deploy_find))
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .child(
@@ -1351,6 +1469,7 @@ impl Render for PdfView {
                     .child(pages_column),
             )
             .child(controls)
+            .children(find_bar)
             .children(self.context_menu.as_ref().map(|(menu, position, _)| {
                 deferred(
                     anchored()
