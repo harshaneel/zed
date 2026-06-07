@@ -13,9 +13,9 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, anyhow};
 use gpui::{
     App, ClipboardItem, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
-    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
-    Point, Render, RenderImage, ScrollHandle, SharedString, Styled, Subscription, Task, Window,
-    actions, anchored, deferred, div, img, px, rgba,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement, Pixels, Point, Render, RenderImage, ScrollHandle, SharedString, Styled,
+    Subscription, Task, Window, actions, anchored, deferred, div, img, px, rgba,
 };
 use hayro::hayro_interpret::font::Glyph;
 use hayro::hayro_interpret::hayro_cmap::BfString;
@@ -940,6 +940,36 @@ impl PdfView {
     fn toggle_whole_word(&mut self, _: &ToggleWholeWord, _: &mut Window, cx: &mut Context<Self>) {
         self.find.options.whole_word = !self.find.options.whole_word;
         self.update_matches(cx);
+    }
+
+    /// Minimal text entry for the find bar: printable chars and backspace edit the
+    /// query; Cmd+V pastes (first line). Enter/Escape/Cmd-G are keymap actions and
+    /// are intentionally not handled here.
+    fn on_find_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let ks = &event.keystroke;
+        let mods = ks.modifiers;
+
+        if ks.key == "backspace" && !mods.platform {
+            self.find.query.pop();
+            self.update_matches(cx);
+            return;
+        }
+        if mods.platform && ks.key == "v" {
+            if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
+                self.find.query.push_str(text.split('\n').next().unwrap_or(""));
+                self.update_matches(cx);
+            }
+            return;
+        }
+        if mods.platform || mods.control || mods.function {
+            return;
+        }
+        if let Some(ch) = ks.key_char.as_ref()
+            && ch.chars().all(|c| !c.is_control())
+        {
+            self.find.query.push_str(ch);
+            self.update_matches(cx);
+        }
     }
 }
 
