@@ -1234,10 +1234,6 @@ mod tests {
         }
     }
 
-    /// Integration: against a real `Project`, `try_open` claims `.pdf` paths and
-    /// declines others. Checks only the (synchronous) routing decision, so it
-    /// needs neither a real file nor a rasterizer — the rasterization task is dropped.
-
     /// Build a `TextGlyph` with the given text; geometry is irrelevant to the
     /// search engine (only glyph counts/order matter for index mapping).
     fn tg(text: &str) -> TextGlyph {
@@ -1316,6 +1312,9 @@ mod tests {
         assert!(matches[1].start_glyph <= matches[2].start_glyph);
     }
 
+    /// Integration: against a real `Project`, `try_open` claims `.pdf` paths and
+    /// declines others. Checks only the (synchronous) routing decision, so it
+    /// needs neither a real file nor a rasterizer — the rasterization task is dropped.
     #[gpui::test]
     async fn test_try_open_routes_only_pdfs(cx: &mut TestAppContext) {
         init_test(cx);
