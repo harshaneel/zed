@@ -901,6 +901,54 @@ fn page_search_text(glyphs: &[TextGlyph]) -> (String, Vec<usize>) {
     (text, starts)
 }
 
+/// Whether two equal-length char windows are equal (case-folded unless
+/// `case_sensitive`).
+fn window_eq(a: &[char], b: &[char], case_sensitive: bool) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(&x, &y)| {
+            if case_sensitive {
+                x == y
+            } else {
+                x == y || x.to_lowercase().eq(y.to_lowercase())
+            }
+        })
+}
+
+/// Map a match byte range `[b0, b1)` in the page text to a glyph range
+/// `[start_glyph, end_glyph)` (end exclusive, always non-empty).
+fn byte_range_to_glyphs(starts: &[usize], b0: usize, b1: usize) -> (usize, usize) {
+    let start_glyph = starts.partition_point(|&s| s <= b0).saturating_sub(1);
+    let end_glyph = starts.partition_point(|&s| s < b1).max(start_glyph + 1);
+    (start_glyph, end_glyph)
+}
+
+/// Find all non-overlapping matches of `query` within one page's glyphs.
+/// Returns page-local glyph ranges `(start_glyph, end_glyph)` (end exclusive).
+/// Matching works in char space so case folding can't desync byte offsets.
+fn find_in_glyphs(glyphs: &[TextGlyph], query: &str, opts: FindOptions) -> Vec<(usize, usize)> {
+    if query.is_empty() || glyphs.is_empty() {
+        return Vec::new();
+    }
+    let (text, starts) = page_search_text(glyphs);
+    let chars: Vec<char> = text.chars().collect();
+    let char_bytes: Vec<usize> = text.char_indices().map(|(b, _)| b).collect();
+    let q: Vec<char> = query.chars().collect();
+    let (n, m) = (chars.len(), q.len());
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + m <= n {
+        if window_eq(&chars[i..i + m], &q, opts.case_sensitive) {
+            let b0 = char_bytes[i];
+            let b1 = if i + m < n { char_bytes[i + m] } else { text.len() };
+            out.push(byte_range_to_glyphs(&starts, b0, b1));
+            i += m;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
 impl EventEmitter<()> for PdfView {}
 
 impl Focusable for PdfView {
@@ -1174,6 +1222,27 @@ mod tests {
         let (text, starts) = page_search_text(&glyphs);
         assert_eq!(text, "Hello wörld");
         assert_eq!(starts, vec![0, 2, 5, 6]);
+    }
+
+    #[test]
+    fn test_find_case_insensitive_multiple() {
+        let glyphs = vec![tg("Hello "), tg("hello "), tg("HELLO")];
+        let m = find_in_glyphs(&glyphs, "hello", FindOptions::default());
+        assert_eq!(m.len(), 3, "case-insensitive default matches all three");
+    }
+
+    #[test]
+    fn test_find_maps_match_across_glyph_boundary() {
+        let glyphs = vec![tg("ab"), tg("cd"), tg("ef")];
+        let m = find_in_glyphs(&glyphs, "bcd", FindOptions::default());
+        assert_eq!(m, vec![(0, 2)], "covers glyph 0 and 1, exclusive end");
+    }
+
+    #[test]
+    fn test_find_empty_query_and_no_match() {
+        let glyphs = vec![tg("abc")];
+        assert!(find_in_glyphs(&glyphs, "", FindOptions::default()).is_empty());
+        assert!(find_in_glyphs(&glyphs, "zzz", FindOptions::default()).is_empty());
     }
 
     #[gpui::test]
