@@ -1237,6 +1237,7 @@ mod tests {
     /// Integration: against a real `Project`, `try_open` claims `.pdf` paths and
     /// declines others. Checks only the (synchronous) routing decision, so it
     /// needs neither a real file nor a rasterizer — the rasterization task is dropped.
+
     /// Build a `TextGlyph` with the given text; geometry is irrelevant to the
     /// search engine (only glyph counts/order matter for index mapping).
     fn tg(text: &str) -> TextGlyph {
@@ -1289,6 +1290,17 @@ mod tests {
 
         let loose = find_in_glyphs(&glyphs, "cat", FindOptions::default());
         assert_eq!(loose.len(), 3);
+    }
+
+    #[test]
+    fn test_find_whole_word_boundary_in_next_glyph() {
+        // The space that forms the trailing word boundary lives in a *different*
+        // glyph than the word, confirming whole-word works over concatenated page
+        // text rather than per-glyph.
+        let glyphs = vec![tg("cat"), tg(" end")];
+        let opts = FindOptions { case_sensitive: false, whole_word: true };
+        let m = find_in_glyphs(&glyphs, "cat", opts);
+        assert_eq!(m.len(), 1, "'cat' is whole-word bounded by the space in glyph 1");
     }
 
     #[test]
