@@ -3,11 +3,22 @@
     "context": "PdfViewer",
     "bindings": {
       "cmd-c": "pdf_viewer::CopySelection",
+      "cmd-f": "pdf_viewer::DeployFind",
       "cmd-=": "pdf_viewer::ZoomIn",
       "cmd-+": "pdf_viewer::ZoomIn",
       "cmd--": "pdf_viewer::ZoomOut",
       "cmd-0": "pdf_viewer::FitWidth",
       "cmd-9": "pdf_viewer::FitPage"
+    }
+  },
+  {
+    "context": "PdfFind",
+    "bindings": {
+      "escape": "pdf_viewer::DismissFind",
+      "enter": "pdf_viewer::SelectNextMatch",
+      "shift-enter": "pdf_viewer::SelectPrevMatch",
+      "cmd-g": "pdf_viewer::SelectNextMatch",
+      "cmd-shift-g": "pdf_viewer::SelectPrevMatch"
     }
   },
   // Standard macOS bindings
