@@ -334,7 +334,7 @@ fn sort_reading_order(glyphs: Vec<TextGlyph>) -> Vec<TextGlyph> {
     }
     let page_width = glyphs.iter().map(|g| g.x + g.w).fold(0.0_f32, f32::max);
     let Some(split) = detect_column_split(&glyphs, page_width) else {
-        return cluster_rows(glyphs).into_iter().flatten().collect();
+        return insert_word_spaces(cluster_rows(glyphs).into_iter().flatten().collect());
     };
 
     let rows = cluster_rows(glyphs);
@@ -359,6 +359,44 @@ fn sort_reading_order(glyphs: Vec<TextGlyph>) -> Vec<TextGlyph> {
                 out.extend(row.iter().filter(|g| g.x + g.w / 2.0 >= split).cloned());
             }
         }
+    }
+    insert_word_spaces(out)
+}
+
+/// PDFs commonly position inter-word spacing instead of drawing a space glyph, so
+/// the captured glyphs run words together ("socialgraph"). Walk the reading-order
+/// glyphs and re-insert a space wherever two consecutive glyphs sit on the same
+/// line (similar baseline, x advancing) with a horizontal gap wide enough to be a
+/// space — roughly a fifth of the em (glyph cell height ≈ em). Line and column
+/// breaks reset x or y, so no space is inserted across them.
+fn insert_word_spaces(glyphs: Vec<TextGlyph>) -> Vec<TextGlyph> {
+    if glyphs.len() < 2 {
+        return glyphs;
+    }
+    let cmp = |a: f32, b: f32| a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal);
+    let mut heights: Vec<f32> = glyphs.iter().map(|g| g.h).filter(|h| *h > 0.0).collect();
+    heights.sort_by(|a, b| cmp(*a, *b));
+    let em = heights.get(heights.len() / 2).copied().unwrap_or(10.0);
+    let tol = em * 0.6; // same-line baseline tolerance (matches selected_text)
+
+    let mut out: Vec<TextGlyph> = Vec::with_capacity(glyphs.len());
+    for g in glyphs {
+        if let Some(prev) = out.last() {
+            let same_line = (g.y - prev.y).abs() <= tol;
+            let gap = g.x - (prev.x + prev.w);
+            let prev_space = prev.text.chars().all(char::is_whitespace);
+            let g_space = g.text.chars().all(char::is_whitespace);
+            if same_line && gap > 0.2 * em && !prev_space && !g_space {
+                out.push(TextGlyph {
+                    text: " ".to_string(),
+                    x: prev.x + prev.w,
+                    y: prev.y,
+                    w: gap,
+                    h: prev.h.max(g.h),
+                });
+            }
+        }
+        out.push(g);
     }
     out
 }
@@ -1550,6 +1588,51 @@ mod tests {
     /// search engine (only glyph counts/order matter for index mapping).
     fn tg(text: &str) -> TextGlyph {
         TextGlyph { text: text.to_string(), x: 0.0, y: 0.0, w: 1.0, h: 1.0 }
+    }
+
+    /// Build a positioned `TextGlyph` (for space-inference / layout tests).
+    fn tgp(text: &str, x: f32, y: f32, w: f32, h: f32) -> TextGlyph {
+        TextGlyph { text: text.to_string(), x, y, w, h }
+    }
+
+    fn joined(glyphs: &[TextGlyph]) -> String {
+        glyphs.iter().map(|g| g.text.as_str()).collect()
+    }
+
+    #[test]
+    fn test_insert_word_spaces_fills_gaps() {
+        // Two words on one line (em=10) separated by a 5px gap (> 0.2*em) get a
+        // space; the letters within a word abut (gap 0) and stay joined.
+        let glyphs = vec![
+            tgp("In", 0.0, 0.0, 10.0, 10.0),
+            tgp("Fig", 15.0, 0.0, 12.0, 10.0),
+        ];
+        let out = insert_word_spaces(glyphs);
+        assert_eq!(joined(&out), "In Fig");
+    }
+
+    #[test]
+    fn test_insert_word_spaces_no_space_when_tight() {
+        // Cells abut (gap 0) — same word, no space inserted.
+        let glyphs = vec![
+            tgp("so", 0.0, 0.0, 10.0, 10.0),
+            tgp("cial", 10.0, 0.0, 20.0, 10.0),
+        ];
+        let out = insert_word_spaces(glyphs);
+        assert_eq!(joined(&out), "social");
+    }
+
+    #[test]
+    fn test_insert_word_spaces_not_across_line_break() {
+        // Next glyph drops to a new baseline (y jump > tol) — a line break, not a
+        // word gap, so no space is inserted (the copy path adds the newline).
+        let glyphs = vec![
+            tgp("end", 50.0, 0.0, 10.0, 10.0),
+            tgp("next", 0.0, 20.0, 10.0, 10.0),
+        ];
+        let out = insert_word_spaces(glyphs);
+        assert_eq!(joined(&out), "endnext");
+        assert_eq!(out.len(), 2, "no space glyph inserted across the line break");
     }
 
     #[test]
