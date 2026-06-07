@@ -960,6 +960,22 @@ fn find_in_glyphs(glyphs: &[TextGlyph], query: &str, opts: FindOptions) -> Vec<(
     out
 }
 
+/// Find matches across all pages. `pages` yields each page's glyph slice in page
+/// order; matches are returned ordered by `(page_ix, start_glyph)`.
+fn find_matches<'a>(
+    pages: impl IntoIterator<Item = &'a [TextGlyph]>,
+    query: &str,
+    opts: FindOptions,
+) -> Vec<FindMatch> {
+    let mut out = Vec::new();
+    for (page_ix, glyphs) in pages.into_iter().enumerate() {
+        for (start_glyph, end_glyph) in find_in_glyphs(glyphs, query, opts) {
+            out.push(FindMatch { page_ix, start_glyph, end_glyph });
+        }
+    }
+    out
+}
+
 impl EventEmitter<()> for PdfView {}
 
 impl Focusable for PdfView {
@@ -1273,6 +1289,19 @@ mod tests {
 
         let loose = find_in_glyphs(&glyphs, "cat", FindOptions::default());
         assert_eq!(loose.len(), 3);
+    }
+
+    #[test]
+    fn test_find_matches_across_pages() {
+        let page0 = vec![tg("alpha "), tg("beta")];
+        let page1 = vec![tg("beta "), tg("beta")];
+        let pages = [page0.as_slice(), page1.as_slice()];
+        let matches = find_matches(pages.iter().copied(), "beta", FindOptions::default());
+        assert_eq!(matches.len(), 3);
+        assert_eq!(matches[0].page_ix, 0);
+        assert_eq!(matches[1].page_ix, 1);
+        assert_eq!(matches[2].page_ix, 1);
+        assert!(matches[1].start_glyph <= matches[2].start_glyph);
     }
 
     #[gpui::test]
