@@ -922,6 +922,15 @@ fn byte_range_to_glyphs(starts: &[usize], b0: usize, b1: usize) -> (usize, usize
     (start_glyph, end_glyph)
 }
 
+/// Whether the `len`-char window starting at `start` is bounded by word
+/// separators (non-alphanumeric chars or the string edges) on both sides.
+fn is_word_bounded(chars: &[char], start: usize, len: usize) -> bool {
+    let before_ok = start == 0 || !chars[start - 1].is_alphanumeric();
+    let after = start + len;
+    let after_ok = after >= chars.len() || !chars[after].is_alphanumeric();
+    before_ok && after_ok
+}
+
 /// Find all non-overlapping matches of `query` within one page's glyphs.
 /// Returns page-local glyph ranges `(start_glyph, end_glyph)` (end exclusive).
 /// Matching works in char space so case folding can't desync byte offsets.
@@ -937,7 +946,9 @@ fn find_in_glyphs(glyphs: &[TextGlyph], query: &str, opts: FindOptions) -> Vec<(
     let mut out = Vec::new();
     let mut i = 0;
     while i + m <= n {
-        if window_eq(&chars[i..i + m], &q, opts.case_sensitive) {
+        if window_eq(&chars[i..i + m], &q, opts.case_sensitive)
+            && (!opts.whole_word || is_word_bounded(&chars, i, m))
+        {
             let b0 = char_bytes[i];
             let b1 = if i + m < n { char_bytes[i + m] } else { text.len() };
             out.push(byte_range_to_glyphs(&starts, b0, b1));
@@ -1243,6 +1254,25 @@ mod tests {
         let glyphs = vec![tg("abc")];
         assert!(find_in_glyphs(&glyphs, "", FindOptions::default()).is_empty());
         assert!(find_in_glyphs(&glyphs, "zzz", FindOptions::default()).is_empty());
+    }
+
+    #[test]
+    fn test_find_case_sensitive() {
+        let glyphs = vec![tg("Hello "), tg("hello")];
+        let opts = FindOptions { case_sensitive: true, whole_word: false };
+        let m = find_in_glyphs(&glyphs, "hello", opts);
+        assert_eq!(m.len(), 1, "only the lowercase occurrence");
+    }
+
+    #[test]
+    fn test_find_whole_word() {
+        let glyphs = vec![tg("cat "), tg("category "), tg("cat")];
+        let opts = FindOptions { case_sensitive: false, whole_word: true };
+        let m = find_in_glyphs(&glyphs, "cat", opts);
+        assert_eq!(m.len(), 2, "standalone 'cat' x2, not the 'cat' inside 'category'");
+
+        let loose = find_in_glyphs(&glyphs, "cat", FindOptions::default());
+        assert_eq!(loose.len(), 3);
     }
 
     #[gpui::test]
