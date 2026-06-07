@@ -868,11 +868,79 @@ impl PdfView {
         cx.notify();
     }
 
-    fn first_match_from_viewport(&self, _matches: &[FindMatch], _cx: &App) -> usize {
-        0
+    /// Content-space y (relative to the page column's top) of a match's first glyph.
+    fn match_content_y(&self, m: &FindMatch, cx: &App) -> f32 {
+        let pages = &self.pdf_item.read(cx).pages;
+        let mut y = PAGE_GAP;
+        for (ix, page) in pages.iter().enumerate() {
+            let scale = self.display_width / page.width as f32;
+            if ix == m.page_ix {
+                let gy = page.glyphs.get(m.start_glyph).map(|g| g.y).unwrap_or(0.0);
+                return y + gy * scale;
+            }
+            y += page.height as f32 * scale + PAGE_GAP;
+        }
+        y
     }
 
-    fn scroll_current_match_into_view(&mut self, _cx: &mut Context<Self>) {}
+    /// First match at or after the current viewport top (fallback: first match).
+    fn first_match_from_viewport(&self, matches: &[FindMatch], cx: &App) -> usize {
+        let top = -f32::from(self.scroll_handle.offset().y);
+        matches
+            .iter()
+            .position(|m| self.match_content_y(m, cx) >= top)
+            .unwrap_or(0)
+    }
+
+    /// Scroll so the current match is vertically centered in the viewport.
+    fn scroll_current_match_into_view(&mut self, cx: &mut Context<Self>) {
+        let Some(ci) = self.find.current else { return };
+        let Some(m) = self.find.matches.get(ci).copied() else {
+            return;
+        };
+        let content_y = self.match_content_y(&m, cx);
+        let viewport_h = f32::from(self.scroll_handle.bounds().size.height);
+        let mut offset = self.scroll_handle.offset();
+        offset.y = px(viewport_h / 2.0 - content_y);
+        self.scroll_handle.set_offset(offset);
+    }
+
+    fn select_next_match(&mut self, _: &SelectNextMatch, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_match(1, cx);
+    }
+
+    fn select_prev_match(&mut self, _: &SelectPrevMatch, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_match(-1, cx);
+    }
+
+    /// Move the current match by `dir` (+1 next, -1 prev) with wraparound and
+    /// scroll it into view.
+    fn step_match(&mut self, dir: isize, cx: &mut Context<Self>) {
+        let n = self.find.matches.len();
+        if n == 0 {
+            return;
+        }
+        let cur = self.find.current.unwrap_or(0) as isize;
+        let next = (cur + dir).rem_euclid(n as isize) as usize;
+        self.find.current = Some(next);
+        self.scroll_current_match_into_view(cx);
+        cx.notify();
+    }
+
+    fn toggle_case_sensitive(
+        &mut self,
+        _: &ToggleCaseSensitive,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.find.options.case_sensitive = !self.find.options.case_sensitive;
+        self.update_matches(cx);
+    }
+
+    fn toggle_whole_word(&mut self, _: &ToggleWholeWord, _: &mut Window, cx: &mut Context<Self>) {
+        self.find.options.whole_word = !self.find.options.whole_word;
+        self.update_matches(cx);
+    }
 }
 
 /// Merge selected glyphs into one rectangle per visual line, so the highlight
