@@ -64,7 +64,19 @@ actions!(
         /// Fit the page width to the viewport.
         FitWidth,
         /// Fit the whole page within the viewport.
-        FitPage
+        FitPage,
+        /// Open the in-document find bar.
+        DeployFind,
+        /// Close the find bar and clear match highlights.
+        DismissFind,
+        /// Select the next match.
+        SelectNextMatch,
+        /// Select the previous match.
+        SelectPrevMatch,
+        /// Toggle case-sensitive matching.
+        ToggleCaseSensitive,
+        /// Toggle whole-word matching.
+        ToggleWholeWord
     ]
 );
 
@@ -111,6 +123,17 @@ impl Selection {
     fn bounds(&self) -> (usize, usize) {
         (self.anchor.min(self.head), self.anchor.max(self.head))
     }
+}
+
+/// In-document find state: the query, options, the current match list (page-local
+/// glyph ranges), and which match is selected.
+#[derive(Default)]
+struct FindState {
+    active: bool,
+    query: String,
+    options: FindOptions,
+    matches: Vec<FindMatch>,
+    current: Option<usize>,
 }
 
 /// Project-level item: holds the rasterized pages for one PDF file.
@@ -494,6 +517,10 @@ pub struct PdfView {
     display_width: f32,
     /// Open right-click menu: (menu, click position, dismiss subscription).
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
+    /// In-document find bar state.
+    find: FindState,
+    /// Focus target for the find bar's text input.
+    find_focus_handle: FocusHandle,
 }
 
 impl PdfView {
@@ -509,6 +536,8 @@ impl PdfView {
             autoscroll_task: None,
             display_width: DEFAULT_DISPLAY_WIDTH,
             context_menu: None,
+            find: FindState::default(),
+            find_focus_handle: cx.focus_handle(),
         }
     }
 
@@ -793,6 +822,57 @@ impl PdfView {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
     }
+
+    fn deploy_find(&mut self, _: &DeployFind, window: &mut Window, cx: &mut Context<Self>) {
+        self.find.active = true;
+        if self.find.query.is_empty()
+            && let Some(text) = self.selected_text(cx)
+        {
+            let seed: String = text.split('\n').next().unwrap_or("").chars().take(80).collect();
+            if !seed.trim().is_empty() {
+                self.find.query = seed;
+            }
+        }
+        window.focus(&self.find_focus_handle, cx);
+        self.update_matches(cx);
+    }
+
+    fn dismiss_find(&mut self, _: &DismissFind, window: &mut Window, cx: &mut Context<Self>) {
+        self.find.active = false;
+        self.find.matches.clear();
+        self.find.current = None;
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    /// Recompute matches for the current query/options, pick a current match, and
+    /// scroll it into view.
+    fn update_matches(&mut self, cx: &mut Context<Self>) {
+        let matches = {
+            let pages = &self.pdf_item.read(cx).pages;
+            find_matches(
+                pages.iter().map(|p| p.glyphs.as_slice()),
+                &self.find.query,
+                self.find.options,
+            )
+        };
+        self.find.current = if matches.is_empty() {
+            None
+        } else {
+            Some(self.first_match_from_viewport(&matches, cx))
+        };
+        self.find.matches = matches;
+        if self.find.current.is_some() {
+            self.scroll_current_match_into_view(cx);
+        }
+        cx.notify();
+    }
+
+    fn first_match_from_viewport(&self, _matches: &[FindMatch], _cx: &App) -> usize {
+        0
+    }
+
+    fn scroll_current_match_into_view(&mut self, _cx: &mut Context<Self>) {}
 }
 
 /// Merge selected glyphs into one rectangle per visual line, so the highlight
