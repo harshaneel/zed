@@ -826,6 +826,8 @@ impl PdfView {
 
     fn deploy_find(&mut self, _: &DeployFind, window: &mut Window, cx: &mut Context<Self>) {
         self.find.active = true;
+        // Re-pressing Cmd+F here only re-focuses; it does not select-all the query
+        // for retyping (the input is a rendered label, not a real text field).
         if self.find.query.is_empty()
             && let Some(text) = self.selected_text(cx)
         {
@@ -950,9 +952,14 @@ impl PdfView {
         let ks = &event.keystroke;
         let mods = ks.modifiers;
 
-        if ks.key == "backspace" && !mods.platform {
-            self.find.query.pop();
-            self.update_matches(cx);
+        // Plain Backspace deletes one char. Modified variants (Cmd/Option/Ctrl +
+        // Backspace = delete-word/line) are not implemented; ignore them rather
+        // than treating them as a single delete.
+        if ks.key == "backspace" {
+            if !mods.platform && !mods.alt && !mods.control {
+                self.find.query.pop();
+                self.update_matches(cx);
+            }
             return;
         }
         if mods.platform && ks.key == "v" {
